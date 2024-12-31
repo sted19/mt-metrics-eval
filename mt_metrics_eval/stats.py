@@ -39,6 +39,8 @@ import numpy.typing
 import scipy.special
 import scipy.stats
 
+from typing import Tuple
+from itertools import permutations, product
 
 ArrayLike = numpy.typing.ArrayLike
 
@@ -119,6 +121,20 @@ class Correlation:
         KendallWithTiesOpt, average_by, variant=variant,
         sample_rate=sample_rate)
     return cf(self.gold_scores, self.metric_scores)
+
+  '''
+  def DCG(self, average_by='item'):
+    """Discounted Cumulative Gain."""
+    cf = self.AverageCorrelation(
+      dcg, 
+      num_sys=self.num_sys, 
+      average_by=average_by, 
+      filter_nones=True,
+      replace_nans_with_zeros=False,
+      macro=True
+    )
+    return cf(self.gold_scores, self.metric_scores)
+  '''
 
 
 def filter_gold_nones(
@@ -539,6 +555,123 @@ def KendallVariants(
         "variant must be 'b', 'c', '23', or 'acc23'.")
 
   return tau, 0
+
+def dcg(gold_scores: ArrayLike, metric_scores: ArrayLike) -> Tuple[float]:
+    """
+    Compute DCG by using:
+    - 'metric_scores' to rank items
+    - 'gold_scores' as the relevance for each item.
+
+    If k is None, we use all items.
+    """
+    k = len(gold_scores)
+
+    # Step 1: sort items by metric_scores (descending)
+    # If there's a tie, np.argsort is stable. We could also break ties randomly.
+    indices = np.argsort(metric_scores)[::-1]  # descending order
+
+    # Step 2: compute DCG using sorted (by metric) items' human_scores
+    dcg_val = 0.0
+    for i, idx in enumerate(indices[:k]):
+        # i is the position in the ranked list (0-based)
+        # "rel" is the human score of this item
+        rel = gold_scores[idx]
+        # typical DCG formula: (rel) / log2(i+2)
+        # (i+2) because i is 0-based
+        dcg_val += (rel) / np.log2(i+2)
+
+    return (dcg_val, 0.0)
+
+def dcg_permutation_ties(gold_scores: ArrayLike, metric_scores: ArrayLike) -> Tuple[float]:
+    """
+    Compute the DCG under random tie-breaking:
+      - Sort tie groups in descending order of metric scores
+      - For each tie group of size s, the group occupies positions [p, p+s-1].
+      - The expected discount for each item in that group is the average discount of those positions.
+      - Multiply that expected discount by each item's relevance, then sum over the group.
+
+    Returns:
+        float: the tie-aware (expected) DCG
+    """
+
+    gold_scores = np.array(gold_scores)
+    metric_scores = np.array(metric_scores)
+
+    # 1. Identify all tie groups in descending order of metric scores
+    #    We'll group items that share the same metric score
+    desc_sorted_indices = np.argsort(metric_scores)[::-1]
+    sorted_scores = metric_scores[desc_sorted_indices]
+    sorted_gold = gold_scores[desc_sorted_indices]
+
+    # We'll iterate through sorted_scores and group items with the same score
+    tie_groups = []
+    start_idx = 0
+    while start_idx < len(sorted_scores):
+        current_score = sorted_scores[start_idx]
+        # find how many items share this metric score
+        group_end = start_idx
+        while (group_end < len(sorted_scores) and
+               sorted_scores[group_end] == current_score):
+            group_end += 1
+        # all items from [start_idx..group_end-1] form a tie group
+        tie_groups.append(
+            (start_idx, group_end)  # store the slice boundaries in the sorted list
+        )
+        start_idx = group_end
+
+    # Step 2: For each tie group, compute all permutations of that group’s indices
+    #         We then take the cartesian product of permutations from all tie groups
+    group_permutations = []
+    for (gstart, gend) in tie_groups:
+        group_indices = desc_sorted_indices[gstart:gend]  # actual item indices in that tie group
+        # All permutations of the item indices within this group
+        # e.g. if group_indices = [3, 7], then permutations => [(3,7), (7,3)]
+        perms = list(permutations(group_indices))
+        group_permutations.append(perms)
+
+    # Step 5: Compute DCG for each ranking, sum, and average
+    dcg = 0.0
+    for group_perm in group_permutations:
+        dcg += average_dcg_across_tie_permutations(group_perm, sorted_gold)
+
+    return (dcg, 0,)
+
+def average_dcg_across_tie_permutations(group_metric_indices, gold_scores) -> float:
+    average_dcg = 0
+    for indices in group_metric_indices:
+        dcg_sum = 0
+        for i, idx in enumerate(indices):
+            rel = gold_scores[idx]
+            dcg_sum += rel / np.log2(i + 2)
+        average_dcg += dcg_sum
+    
+    return average_dcg / len(group_metric_indices)
+
+
+def ndcg(gold_scores: ArrayLike, metric_scores: ArrayLike) -> float:
+    """
+    Compute NDCG (Normalized Discounted Cumulative Gain):
+    1. Compute DCG using 'metric_scores' as ranking criteria
+    2. Compute the ideal DCG (IDCG) by sorting gold_scores in descending order
+    3. Return the ratio: DCG / IDCG
+
+    Returns:
+        float: Normalized Discounted Cumulative Gain
+    """
+    # 1. Compute actual DCG
+    actual_dcg = dcg_permutation_ties(gold_scores, metric_scores)[0]
+
+    # 2. Compute ideal DCG by using gold_scores themselves as the perfect ranking
+    sorted_gold = np.sort(gold_scores)[::-1]
+    k = len(gold_scores)
+    ideal_dcg = 0.0
+    for i in range(k):
+        ideal_dcg += sorted_gold[i] / np.log2(i + 2)
+
+    # Avoid division by zero if all gold_scores are zero
+    # in that case, it means that all translations have the same score of 0.
+    # therefore, any ranking is perfect, and the NDCG is 1.0
+    return (ideal_dcg / actual_dcg if ideal_dcg < 0 else 1.0, 0.0, )
 
 
 def KendallWithTiesOpt(
